@@ -1,0 +1,6 @@
+[submodule "PrivateDecisionTree"]
+	path = PrivateDecisionTree
+	url = git@github.com:fionser/PrivateDecisionTree.git
+[submodule "mcl"]
+	path = mcl
+	url = git@github.com:herumi/mcl.git
