@@ -1,5 +1,4 @@
-## Implementation XCMP on [SEAL](https://www.microsoft.com/en-us/research/publication/simple-encrypted-arithmetic-library-seal-v2-2)
+## Implementation XCMP on [SEAL](https://github.com/Microsoft/SEAL)
 
-The codes should work. But the SEAL does not support automorphism as HElib does, so some codes in `main.cpp` just used to show the performance of the SEAL implementation.
-
-
+* Also implement the domain extension tech from Ishimaki et al. 's paper _Non-Interactive and Fully Output Expressive Private Comparison_.
+  * Basically, take advantage automorphism to erase terms of encrypted polynomial, and keepping only the constant term.

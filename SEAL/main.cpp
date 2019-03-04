@@ -1,195 +1,207 @@
-#include <iostream>
-#include <vector>
-#include <string>
-
-#include "seal/seal.h"
-#include <NTL/ZZ.h>
-#include <chrono>
-
-using std::chrono::duration_cast;
-typedef std::chrono::nanoseconds Time_t;
-typedef std::chrono::high_resolution_clock Clock;
-double time_as_second(const Time_t &t) { return t.count() / 1.0e9; }
-double time_as_millsecond(const Time_t &t) { return t.count() / 1.0e6; }
-std::pair<double, double> mean_std(std::vector<double> const& times, long ignore) {
-    long sze = times.size();
-    double mean = 0.;
-    for (long i = ignore; i < sze; i++) {
-        mean += times[i];
-    }
-    mean /= (sze - ignore);
-    double std_dev = 0.;
-    for (long i = ignore; i < sze; i++) {
-        std_dev += (times[i] - mean) * (times[i] - mean);
-    }
-    std_dev = std::sqrt(std_dev / (sze - ignore - 1));
-    return {mean, std_dev};
-}
-
-
+#include <seal/seal.h>
 using namespace seal;
 
-void run_private_comparison();
+struct ComparableCipher {
+  std::array<seal::Ciphertext *, 2> dat_;
+  
+  ComparableCipher() : dat_({nullptr, nullptr}) {
+    dat_[0] = new seal::Ciphertext();
+    dat_[1] = new seal::Ciphertext();
+  }
 
-int main()
-{
-    run_private_comparison();
-    return 0;
-}
-
-void encrypt_on_degree(Ciphertext &c,
-                       long v,
-                       Encryptor &encr)
-
-{
-    std::string str = "1x^" + std::to_string(v);
-    Plaintext plain(str);
-    encr.encrypt(plain, c);
-}
-
-Plaintext create_test_vector(long m, uint64_t coeff = 1) {
-    Plaintext poly(m);
-    for (long i = m - 1; i >= 0; i--) {
-        poly[i] = coeff;
+  ~ComparableCipher() {
+    for (int i : {0, 1}) {
+      if (dat_[i]) {
+        delete dat_[i];
+      }
     }
-    return poly;
-}
-
-struct CompareArgs {
-    Plaintext test_v;
-    int64_t mu0, mu1;
-    uint64_t half;
+  }
 };
 
-CompareArgs create_compare_args(uint64_t gt,
-                                uint64_t otherwise,
-                                SEALContext const& context)
+void encrypt_comparable_int(uint32_t v,
+                            std::shared_ptr<seal::SEALContext> context,
+                            seal::Encryptor &encryptor,
+                            ComparableCipher &out)
 {
-    uint64_t p = context.plain_modulus().value();
-    CompareArgs args;
-    args.mu0 = gt;
-    args.mu1 = otherwise;
-    uint64_t inv = NTL::InvMod(2, p);
-    args.half = ((gt + otherwise) * inv) % p; // (mu0 + mu1)/2
-    uint64_t coeff;
-    if (otherwise > args.half) {
-        coeff = otherwise - args.half;
-    } else {
-        coeff = p + otherwise - args.half;
-    }
-    long m = context.poly_modulus().coeff_count() - 1;
-    args.test_v = create_test_vector(m, coeff);
-    return args;
+  const long d = context->context_data()->parms().poly_modulus_degree();
+  if (v >= d * d) {
+    std::cerr << "out of range error: the maximum value to encrypt is " << d * d << "\n";
+    return;
+  }
+  // v = v1 * d + v0
+  uint32_t v0 = v % d;
+  uint32_t v1 = v / d;
+  seal::Plaintext plain(d, d);
+  plain.set_zero();
+  // X^{v0}
+  plain.data()[v0] = 1;
+  encryptor.encrypt(plain, *(out.dat_[0]));
+  // X^{v1}
+  plain.data()[v0] = 0;
+  plain.data()[v1] = 1;
+  encryptor.encrypt(plain, *(out.dat_[1]));
 }
 
-void random_poly(Plaintext &poly,
-                 long degree,
-                 uint64_t modulus) {
-    poly.resize(degree);
-    for (long i = degree - 1; i >= 0; i--) {
-         poly[i] = NTL::RandomBnd(modulus);
-    }
+// Keep only the constant term (i.e., p0) of the encrypted polynomial p(X).
+// Enc(p(X)) --> Enc(p0)
+// Complexity: logN galois depth, where N is the parameter in the poly modulus X^N + 1.
+void zero_out_non_constant_terms(seal::Ciphertext &ctx,
+                                 std::shared_ptr<seal::SEALContext> context,
+                                 seal::Evaluator &evaluator,
+                                 seal::GaloisKeys& gal_keys)
+{
+  const auto& parms = context->context_data()->parms();
+  const long d = parms.poly_modulus_degree();
+  const long n = (long) (std::log2((double) d));
+  for (long i = 0; i < n; ++i) {
+    Ciphertext tmp{ctx};
+    evaluator.apply_galois_inplace(tmp, (d / (1 << i)) + 1, gal_keys);
+    evaluator.add_inplace(ctx, tmp);
+  }
+
+  Plaintext plain(d, d);
+  plain.set_zero();
+
+  uint64_t inv_d;
+  util::try_mod_inverse(d, parms.plain_modulus().value(), inv_d);
+  plain.data(0)[0] = inv_d;
+  evaluator.multiply_plain_inplace(ctx, plain);
 }
 
-Ciphertext compare(Ciphertext const& c,
-                   long b,
-                   CompareArgs const& args,
-                   SEALContext const& context,
-                   Evaluator &evl)
+// The low-level to inequality-test two encrypted integer range in [0, d).
+void __neq_ciphers(seal::Ciphertext const& c0, // X^{a}
+                   seal::Ciphertext const& c1, // X^{-b}
+                   std::shared_ptr<seal::SEALContext> context,
+                   seal::Evaluator &evaluator,
+                   seal::GaloisKeys& gal_keys,
+                   seal::Ciphertext &out)
 {
-    long m = context.poly_modulus().coeff_count() - 1;
-    uint64_t p = context.plain_modulus().value();
-    std::string hex;
-    auto tv(args.test_v);
+  const auto& parms = context->context_data()->parms();
+  const long d = parms.poly_modulus_degree();
+  const uint64_t p = parms.plain_modulus().value();
 
-    // negate the coefficient from X^{m - b - 1} to X^{m-1}
-    for (long i = 1; i <= b; i++)
-        tv[m - i] = p - tv[m - i];
+  evaluator.multiply(c0, c1, out); // X^{a - b}
 
-    Ciphertext ret(c);
-    evl.multiply_plain(ret, tv); //X^{a-b} * test_v
-
-    random_poly(tv, m, p);
-    tv[0] = args.half;
-    evl.add_plain(ret, tv);
-    return ret;
+  seal::Plaintext plain(d, d);
+  plain.data()[0] = 1; // 1
+  evaluator.sub_plain_inplace(out, plain);
+  evaluator.negate_inplace(out);
 }
 
-/// NOTE. SEAL does not support Frobinious map yet.
-/// So this function just for benchmarking
-Ciphertext compare(Ciphertext const& a,
-                   Ciphertext const& b,
-                   CompareArgs const& args,
-                   SEALContext const& context,
-                   Evaluator &evl)
+// The low-level to compare two encrypted integer range in [0, d).
+void __compare_ciphers(seal::Ciphertext const& c0, // X^{a}
+                       seal::Ciphertext const& c1, // X^{-b}
+                       std::shared_ptr<seal::SEALContext> context,
+                       seal::Evaluator &evaluator,
+                       seal::GaloisKeys& gal_keys,
+                       seal::Ciphertext &out)
 {
-    long m = context.poly_modulus().coeff_count() - 1;
-    uint64_t p = context.plain_modulus().value();
+  const auto& parms = context->context_data()->parms();
+  const long d = parms.poly_modulus_degree();
+  const uint64_t p = parms.plain_modulus().value();
+  // 2^-1 mod p
+  uint64_t inv2;
+  util::try_mod_inverse(2, p, inv2);
+  uint64_t neg_inv_2 = (p - inv2) % p;
+  seal::Plaintext plain(d, d);
+  for (long i = 0; i < d; ++i)
+    plain.data()[i] = neg_inv_2;
 
-    auto tv(args.test_v);
-    /// Should include a step to negate X^b to X^{-b}
-    Ciphertext ret(a);
-    evl.multiply(ret, b);
-    evl.multiply_plain(ret, tv); //X^{a-b} * test_v
+  evaluator.multiply(c0, c1, out);
+  evaluator.multiply_plain_inplace(out, plain);
 
-    random_poly(tv, m, p);
-    tv[0] = args.half;
-    evl.add_plain(ret, tv);
-    return ret;
+  plain.set_zero();
+  plain.data()[0] = inv2;
+  for (long i = 1; i < d; ++i)
+      plain.data()[i] = std::rand() % p;
+  evaluator.add_plain_inplace(out, plain);
 }
 
-void run_private_comparison()
+// Compare the encrypted integers range in [0, d^2)
+// Return a ciphertext that decrypts a poly p(X) 
+// if c0 > c1, then p[0] = 1
+//             else p[0] = 0
+void compare_ciphers(ComparableCipher const& c0,
+                     ComparableCipher const& c1,
+                     std::shared_ptr<seal::SEALContext> context,
+                     seal::Evaluator &evaluator,
+                     seal::RelinKeys &relin_key,
+                     seal::GaloisKeys &gal_keys,
+                     seal::Ciphertext &out)
 {
-    long m = 4096;
-    long p = 1013;
-    EncryptionParameters parms;
-    parms.set_poly_modulus("1x^" + std::to_string(m) + " + 1");
-    parms.set_coeff_modulus(coeff_modulus_128(m));
-    parms.set_plain_modulus(p); // can be non prime
-    SEALContext context(parms);
+  const auto& parms = context->context_data()->parms();
+  const long d = parms.poly_modulus_degree();
 
-    IntegerEncoder encoder(context.plain_modulus());
+  seal::Ciphertext c1_lo{*c1.dat_[0]};
+  seal::Ciphertext c1_hi{*c1.dat_[1]}; 
+  // negate the second operand
+  evaluator.apply_galois_inplace(c1_lo, 2 * d - 1, gal_keys);
+  evaluator.apply_galois_inplace(c1_hi, 2 * d - 1, gal_keys);
 
-    KeyGenerator keygen(context);
-    PublicKey public_key = keygen.public_key();
-    SecretKey secret_key = keygen.secret_key();
+  // compare the high and low digits
+  seal::Ciphertext cmp_hi, cmp_lo;
+  __compare_ciphers(*c0.dat_[0], c1_lo, context, evaluator, gal_keys, cmp_lo);
+  __compare_ciphers(*c0.dat_[1], c1_hi, context, evaluator, gal_keys, cmp_hi);
+  
+  // The domain extend algorithm.
+  // 1{c0_hi != c1_hi} * (1{c0_hi > c1_hi} - 1{c0_lo > c1_lo}) + 1{c0_lo > c1_lo}) 
+  seal::Ciphertext neq_hi;
+  __neq_ciphers(*c0.dat_[1], c1_hi, context, evaluator, gal_keys, neq_hi);
+  evaluator.relinearize_inplace(neq_hi, relin_key);
+  zero_out_non_constant_terms(neq_hi, context, evaluator, gal_keys);
+  
+  evaluator.sub_inplace(cmp_hi, cmp_lo);
+  evaluator.relinearize_inplace(cmp_hi, relin_key);
+  evaluator.multiply(neq_hi, cmp_hi, out);
+  evaluator.add_inplace(out, cmp_lo);
+  
+  evaluator.relinearize_inplace(out, relin_key);
+}
 
-    Encryptor encryptor(context, public_key);
-    Evaluator evaluator(context);
-    Decryptor decryptor(context, secret_key);
+int main() {
+  EncryptionParameters parms(scheme_type::BFV);
+  parms.set_poly_modulus_degree(8192);
+  parms.set_coeff_modulus(DefaultParams::coeff_modulus_128(8192));
+  parms.set_plain_modulus(1013);
+  auto context = SEALContext::Create(parms);
+  KeyGenerator keygen(context);
+  PublicKey public_key = keygen.public_key();
+  SecretKey secret_key = keygen.secret_key();
 
-    auto gt_args = create_compare_args(1, 0, context);
+  const long d = parms.poly_modulus_degree();
+  const long N = (long) std::log2((double) d);
 
-    Plaintext dec;
-    Ciphertext ctx_a, ctx_b;
-    std::vector<double> times[3];
-    for (int i = 0; i < 1000; i++) {
-        long a = NTL::RandomBnd(m);
-        long b = NTL::RandomBnd(m);
-        uint64_t gt = a > b;
+  auto gal_keys = keygen.galois_keys(30); // two digits
+  auto relin_key = keygen.relin_keys(60); // no digit decomposition
 
-        auto start = Clock::now();
-        encrypt_on_degree(ctx_a, a, encryptor);
-        encrypt_on_degree(ctx_b, b, encryptor);
-        auto end = Clock::now();
-        times[0].push_back(time_as_millsecond(end - start));
+  Encryptor encryptor(context, public_key);
+  Evaluator evaluator(context);
+  Decryptor decryptor(context, secret_key);
 
-        start = Clock::now();
-        auto ret = compare(ctx_a, ctx_b, gt_args, context, evaluator);
-        end = Clock::now();
-        times[1].push_back(time_as_millsecond(end - start));
+  ComparableCipher cc0, cc1;
+  for (long i = 0; i < 10; ++i) {
+    int v0 = std::rand() % (d*d); // the acceptable range is [0, d * d) where d = 8192
+    int v1 = std::rand() % (d*d);
+    encrypt_comparable_int(v0, context, encryptor, cc0);
+    encrypt_comparable_int(v1, context, encryptor, cc1);
 
-        start = Clock::now();
-        decryptor.decrypt(ret, dec);
-        end = Clock::now();
-        times[2].push_back(time_as_millsecond(end - start));
-        if (gt != dec[0])
-            std::cerr << "Error:" << gt << "!= " << dec[0] << std::endl;
+    seal::Ciphertext ans;
+    compare_ciphers(cc0, cc1, context, evaluator, relin_key, gal_keys, ans);
+
+    seal::Plaintext plain(d, d);
+    plain.set_zero();
+    decryptor.decrypt(ans, plain);
+    if (v0 > v1) {
+      if (plain.data()[0] != 1) {
+        std::cout << "v0 > v1 error. want 1 but " << plain.data()[0] << "\n";
+        std::cout << (v0 / d) << " + " << (v0 % d) << "\n";
+        std::cout << (v1 / d) << " + " << (v1 % d) << "\n";
+      }
+    } else if (plain.data()[0] != 0) {
+      std::cout << "v0 <= v1 error. want 0 but " << plain.data()[0] << "\n";
+      std::cout << (v0 / d) << " + " << (v0 % d) << "\n";
+      std::cout << (v1 / d) << " + " << (v1 % d) << "\n";
     }
-
-    for (auto &tt : times) {
-        auto ms = mean_std(tt, 100);
-        std::cout << ms.first << " "  << ms.second << " ";
-    }
-    std::cout << std::endl;
+  }
+  return 0;
 }
